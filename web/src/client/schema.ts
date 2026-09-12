@@ -5878,6 +5878,11 @@ export interface components {
              */
             management_url: string | null;
             /**
+             * Oauth Oidc Label
+             * @description The sign-in button text for the 'oidc' entry in oauth_providers, when that provider is configured with one (oauth_oidc_display_name). Unlike 'Google' or 'GitHub', a generic connection has no brand name this dashboard can hardcode, so an operator supplies one and the dashboard falls back to a generic label when this is null, including when oauth_providers does not carry 'oidc' at all, in which case this is always null and unread.
+             */
+            oauth_oidc_label?: string | null;
+            /**
              * Oauth Providers
              * @description OAuth providers this deployment can sign somebody in with, sorted, one entry per provider with a client ID, a client secret and a public_base_url to build a redirect URI from. The sign-in screen renders a button per entry and none at all when the list is empty, so a provider nobody configured is absent rather than offered and then refused. Additive to sign_in_methods rather than part of it: an OAuth sign-in coexists with whichever typed credential is current, the way a passkey does. Empty for a hybrid gateway, which issues no session.
              */
@@ -7065,6 +7070,11 @@ export interface components {
              * @description The authorization code from the provider's redirect.
              */
             code: string;
+            /**
+             * Iss
+             * @description The RFC 9207 'iss' from the provider's redirect, when it sent one. Checked against this provider's own issuer before the state is even consumed; absent for a provider whose config carries no issuer, which is every one but a generic OIDC connection.
+             */
+            iss?: string | null;
             /**
              * State
              * @description The 'state' from the provider's redirect, as issued by /authorize.

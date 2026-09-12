@@ -133,10 +133,13 @@ workspace roles. Deployment-wide operations require an operator. See
 ## Authentication options
 
 Password sign-in is always tied to an existing identity. Optional passkeys,
-Google OAuth, and GitHub OAuth add ways for that identity to sign in; they do not
-make an unknown account a member. OAuth requires `public_base_url` plus the
-provider's client ID and secret. Passkeys can instead use `public_base_url`, or
-an explicit `webauthn_rp_id` and `webauthn_allowed_origins` pair.
+Google OAuth, GitHub OAuth, and a generic OpenID Connect connection add ways for
+that identity to sign in; they do not make an unknown account a member. OAuth
+requires `public_base_url` plus the provider's client ID and secret, and the
+OpenID Connect connection additionally needs `oauth_oidc_issuer_url`; see
+[OAuth sign-in](access-control.md#oauth-sign-in-google-github-and-any-openid-connect-provider).
+Passkeys can instead use `public_base_url`, or an explicit `webauthn_rp_id` and
+`webauthn_allowed_origins` pair.
 
 Signing in *can* add a membership in one case. If an organization has claimed and
 proven the email domain that the identity's verified address belongs to, the

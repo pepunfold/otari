@@ -49,10 +49,12 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 
 from apron_auth import OAuthClient, ProviderConfig
-from apron_auth.errors import StateError
+from apron_auth.errors import ConfigurationError, OidcDiscoveryError, StateError
 from apron_auth.models import OAuthPendingState as PendingState
+from apron_auth.models import ServerMetadata
 from apron_auth.providers import github as apron_github
 from apron_auth.providers import google as apron_google
+from apron_auth.providers import oidc as apron_oidc
 from fastapi import Response
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +66,8 @@ from gateway.models.tenancy import OAUTH_STATE_TTL_SECONDS, OAuthPendingState
 from gateway.services.tenancy.errors import (
     OAuthExchangeError,
     OAuthNotConfiguredError,
+    OAuthProviderUnavailableError,
+    OAuthProviderUnusableError,
     OAuthStateError,
 )
 
@@ -97,11 +101,26 @@ _FLOW_SECRET_LENGTH = 43
 _PROVIDERS: dict[str, _Provider] = {
     "google": _Provider(label="Google", scopes=("openid", "email", "profile")),
     "github": _Provider(label="GitHub", scopes=("read:user", "user:email")),
+    "oidc": _Provider(label="OIDC", scopes=("openid", "email", "profile")),
 }
 # Kept honest by a unit test as well, but asserted at import so a provider added
 # to one of the two lists and not the other fails on the way up rather than on
 # the first request that names it.
 assert set(_PROVIDERS) == set(OAUTH_PROVIDERS), "OAUTH_PROVIDERS and _PROVIDERS must name the same providers"
+
+# A discovery document is static configuration an IdP publishes, not a
+# per-request fact, so it is read once per process rather than once per
+# authorization and once per exchange. apron-auth deliberately does no caching
+# of its own (``providers.oidc.preset`` says so: it keeps the network call
+# "somewhere a caller can cache"), and this is that place.
+#
+# No expiry. An operator who moves their IdP restarts Otari, which is already
+# what every other value in ``GatewayConfig`` asks of them.
+#
+# Keyed by the URLs it was fetched for rather than held in one slot, so a
+# deployment whose issuer changes under it (a test's, an overlay's) is never
+# served the previous issuer's answer.
+_DISCOVERY_CACHE: dict[tuple[str, str | None], ServerMetadata] = {}
 
 
 @dataclass(frozen=True)
@@ -197,10 +216,11 @@ class _DatabaseStateStore:
     async def save(self, state: PendingState) -> None:
         """Stage one pending authorization, and sweep whatever has expired."""
         if state.metadata:
-            # The row has no column for it, so a caller that starts relying on
-            # apron-auth's save/consume round trip finds out at the write rather
-            # than by reading an empty ``TokenSet.context`` later.
-            msg = "oauth_pending_state does not carry apron-auth state metadata"
+            # The row has a column per field it keeps and none spare, so a
+            # caller that starts relying on apron-auth's save/consume round
+            # trip to carry something finds out at the write rather than by
+            # reading an empty ``TokenSet.context`` later.
+            msg = "oauth_pending_state carries no column for this apron-auth state metadata"
             raise ValueError(msg)
         now = datetime.now(UTC)
         # The sweep rides here rather than on a scheduler because this is the
@@ -333,9 +353,14 @@ async def authorization_url(
     Raises:
         OAuthNotConfiguredError: If this deployment configured no client
             credentials for ``provider``, or does not know its own address.
+        OAuthProviderUnavailableError: If ``provider`` is configured but its
+            live dependency (an OIDC connection's discovery document, read once
+            per process) could not be read.
+        OAuthProviderUnusableError: If that document was read and names a
+            provider this deployment cannot complete a sign-in against.
 
     """
-    client = _client(config, provider, db, flow_secret)
+    client = await _client(config, provider, db, flow_secret)
     url, pending = await client.get_authorization_url(redirect_uri=redirect_uri(config, provider))
     return url, pending.state
 
@@ -348,6 +373,7 @@ async def exchange_code(
     state: str,
     flow_secret: str | None,
     db: AsyncSession,
+    iss: str | None = None,
 ) -> OAuthIdentity:
     """Trade an authorization code for the identity the provider vouches for.
 
@@ -360,22 +386,35 @@ async def exchange_code(
     when it sent none. A callback without it is refused before the database is
     touched: there is no row it could match.
 
+    ``iss`` is the RFC 9207 ``iss`` query parameter the provider's redirect
+    carried, when it sent one. Checked by apron-auth against
+    ``ProviderConfig.issuer`` before ``state`` is even consumed, ahead of
+    everything else: a generic OIDC connection's config carries an issuer, so
+    this is a live check there; Google's and GitHub's presets carry none, so
+    it is a no-op for both.
+
     Raises:
         OAuthNotConfiguredError: If this deployment configured no client
             credentials for ``provider``, or does not know its own address.
         OAuthStateError: If ``state`` names no authorization this deployment is
             still waiting on, for ``provider``, from this browser.
         OAuthExchangeError: If the exchange or the identity fetch fails, for any
-            reason. The provider's own words stay on the traceback and out of
-            the response; see that error's docstring.
+            reason, including an ID token whose issuer, audience, or expiry
+            does not check out. The provider's own words stay on the traceback
+            and out of the response; see that error's docstring.
+        OAuthProviderUnavailableError: If an OIDC connection's discovery
+            document could not be read, which this needs before it can spend
+            a code; ``authorization_url`` documents the pair.
+        OAuthProviderUnusableError: If that document names a provider this
+            deployment cannot complete a sign-in against.
 
     """
     if flow_secret is None:
         logger.warning("Refused a %s callback that carried no flow cookie", provider)
         raise OAuthStateError
-    client = _client(config, provider, db, flow_secret)
+    client = await _client(config, provider, db, flow_secret)
     try:
-        tokens = await client.exchange_code(code=code, state=state)
+        tokens = await client.exchange_code(code=code, state=state, iss=iss)
         profile = await client.fetch_identity(tokens)
     except StateError as error:
         # Ahead of the catch-all below, which would otherwise render a refused
@@ -433,9 +472,15 @@ def _credentials(config: GatewayConfig, provider: str) -> tuple[str, str]:
     return credentials
 
 
-def _client(config: GatewayConfig, provider: str, db: AsyncSession, flow_secret: str) -> OAuthClient:
+async def _client(config: GatewayConfig, provider: str, db: AsyncSession, flow_secret: str) -> OAuthClient:
     """The apron-auth client that builds ``provider``'s authorization URL and spends its code."""
     client_id, client_secret = _credentials(config, provider)
+    state_store = _DatabaseStateStore(db, provider, _flow_hash(flow_secret))
+
+    if provider == "oidc":
+        provider_config, oidc_identity_handler = await _oidc_client_parts(config, client_id, client_secret)
+        return OAuthClient(provider_config, state_store=state_store, identity_handler=oidc_identity_handler)
+
     preset = apron_google.preset if provider == "google" else apron_github.preset
     identity_handler = (
         apron_google.GoogleIdentityHandler() if provider == "google" else apron_github.GitHubIdentityHandler()
@@ -448,9 +493,105 @@ def _client(config: GatewayConfig, provider: str, db: AsyncSession, flow_secret:
     )
     return OAuthClient(
         _as_configured_here(provider_config, provider),
-        state_store=_DatabaseStateStore(db, provider, _flow_hash(flow_secret)),
+        state_store=state_store,
         identity_handler=identity_handler,
     )
+
+
+async def _discovered(issuer_url: str, document_url: str | None) -> ServerMetadata:
+    """``apron_oidc.discover``, fetched on first use and kept for the life of the process.
+
+    Only a success is stored. An IdP that could not be reached the first time a
+    person pressed the button is tried again on the next one, rather than being
+    written off until restart, which is the difference between an outage and a
+    misconfiguration.
+
+    Nothing serializes concurrent first uses. Two sign-ins racing the very
+    first fetch each do one, and the second overwrites the first with the same
+    document; a lock to save one idempotent GET at startup would have to be
+    built per event loop to be safe, which costs more than it saves.
+
+    Raises:
+        OidcDiscoveryError: Straight from apron-auth, for the caller to render.
+    """
+    key = (issuer_url, document_url)
+    cached = _DISCOVERY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    metadata = await apron_oidc.discover(issuer_url, document_url=document_url)
+    _DISCOVERY_CACHE[key] = metadata
+    return metadata
+
+
+def _forget_discovered() -> None:
+    """Empty the cache, for a test that stubs ``apron_oidc.discover``.
+
+    Without it, a document cached by one test is served to the next one, which
+    then never reaches the stub it installed.
+    """
+    _DISCOVERY_CACHE.clear()
+
+
+async def _oidc_client_parts(
+    config: GatewayConfig, client_id: str, client_secret: str
+) -> tuple[ProviderConfig, apron_oidc.OidcIdentityHandler]:
+    """This connection's discovered ``ProviderConfig``, and the handler that reads its ID token.
+
+    One discovery answers both, because apron-auth derives each from the same
+    metadata: the endpoints to talk to, and the issuer and audience an ID token
+    is then checked against. Fetching twice would let the two disagree about
+    the issuer mid-flow, which is the one value the whole connection is
+    anchored on.
+
+    Both refusals below are distinct from ``OAuthNotConfiguredError``: every
+    setting an operator has to set is set. They are logged here rather than at
+    the route, because the route renders them itself and nothing else would
+    write the provider's own reason down.
+
+    Raises:
+        OAuthProviderUnavailableError: If the discovery document could not be
+            fetched, parsed, or named the issuer it was fetched for.
+        OAuthProviderUnusableError: If it was read and is valid, but names a
+            provider this deployment cannot complete a sign-in against.
+    """
+    issuer_url = config.oauth_oidc_issuer_url
+    assert issuer_url is not None  # _credentials already confirmed oidc is configured
+    try:
+        metadata = await _discovered(issuer_url, config.oauth_oidc_discovery_url)
+        provider_config, _revocation_handler = apron_oidc.preset(
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=list(_oidc_scopes(config)),
+            metadata=metadata,
+            redirect_uri=redirect_uri(config, "oidc"),
+        )
+        return provider_config, apron_oidc.identity_handler(metadata, client_id=client_id)
+    except OidcDiscoveryError as error:
+        logger.warning("OIDC discovery against the configured issuer failed", exc_info=True)
+        raise OAuthProviderUnavailableError("oidc") from error
+    except ConfigurationError as error:
+        logger.warning("The configured OIDC provider cannot be used for sign-in", exc_info=True)
+        raise OAuthProviderUnusableError("oidc") from error
+
+
+def _oidc_scopes(config: GatewayConfig) -> tuple[str, ...]:
+    """The default set, or the operator's own in its place.
+
+    Replacing rather than widening, because a generic connection's IdP is not
+    known ahead of time: one that refuses a scope in the default set has to be
+    given a list without it, which an additive setting could never express.
+
+    ``openid`` survives either way. ``apron_oidc.preset`` merges it in, since
+    without it the provider runs a plain OAuth flow, returns no ID token, and
+    nothing below can establish an identity.
+
+    Neither deduplicated nor ordered here: that same preset returns the union
+    sorted, so doing either would be a second opinion the authorization URL
+    never reflects.
+    """
+    if config.oauth_oidc_scopes is None:
+        return _PROVIDERS["oidc"].scopes
+    return tuple(config.oauth_oidc_scopes.split())
 
 
 def _as_configured_here(provider_config: ProviderConfig, provider: str) -> ProviderConfig:

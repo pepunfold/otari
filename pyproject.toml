@@ -136,6 +136,21 @@ environments = [
 # wheel people pip-install directly.
 constraint-dependencies = ["authlib>=1.7.2"]
 
+# TEMPORARY: apron-auth is consumed from the branch that adds
+# `apron_auth.providers.oidc` (what generic OpenID Connect sign-in here is
+# built on), because it is not in a published release yet.
+#
+# A git source resolves anywhere, so unlike a local path it leaves the lock
+# buildable in CI and in a fresh clone. Two things it does not give: the branch
+# can move under the commit `uv.lock` pins, and the `>=0.15.1,<0.16.0` line in
+# `dependencies` stops being enforced, since a source here overrides the
+# specifier rather than narrowing it. The checkout reports `0.1.dev74+...`
+# either way, because uv clones without tags and setuptools_scm has none to
+# count from. Drop this table and raise that pin to the release that carries
+# `providers.oidc` before this branch merges.
+[tool.uv.sources]
+apron-auth = { git = "https://github.com/pepunfold/apron-auth", branch = "feat/generic-oidc-provider" }
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

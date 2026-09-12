@@ -47,7 +47,7 @@ GATEWAY_TOKEN_HEADER = "X-Gateway-Token"
 # Not an enum: the column stores a plain string so an overlay binding its own
 # ``IdentityProviderPort`` can record a connection this tuple never named, and
 # a closed enum here would make that value unrepresentable.
-OAUTH_PROVIDERS: tuple[str, ...] = ("github", "google")
+OAUTH_PROVIDERS: tuple[str, ...] = ("github", "google", "oidc")
 # Per-request opt-out for a policy's learned router: "off" serves the policy's
 # default target and skips the router entirely. There is no "force on": the
 # router is enabled by the policy, not by the caller.
@@ -603,6 +603,49 @@ class GatewayConfig(BaseSettings):
     oauth_github_client_secret: str | None = Field(
         default=None,
         description="The GitHub OAuth client secret paired with oauth_github_client_id.",
+    )
+    oauth_oidc_issuer_url: str | None = Field(
+        default=None,
+        description=(
+            "The issuer URL of a generic OpenID Connect provider (Keycloak, Okta, Azure AD, Auth0, ...) "
+            "dashboard sign-in discovers against, e.g. 'https://keycloak.example.com/realms/otari'. Set this, "
+            "oauth_oidc_client_id and oauth_oidc_client_secret to offer 'Sign in with SSO'; with any missing, the "
+            "provider is absent from the sign-in screen rather than offered and then refused. public_base_url "
+            "has to be set too, because the redirect URI is derived from it. This value doubles as the trust "
+            "anchor every ID token's issuer is checked against, so it must be the value this IdP's own discovery "
+            "document names as its issuer, not merely a URL that resolves to it."
+        ),
+    )
+    oauth_oidc_discovery_url: str | None = Field(
+        default=None,
+        description=(
+            "Override for the discovery document's own URL, when it is not at the standard "
+            "'{issuer}/.well-known/openid-configuration' suffix oauth_oidc_issuer_url derives. Every mainstream "
+            "IdP uses the standard suffix; this exists for one that does not."
+        ),
+    )
+    oauth_oidc_client_id: str | None = Field(
+        default=None,
+        description="The OAuth client ID this generic OIDC connection authenticates as.",
+    )
+    oauth_oidc_client_secret: str | None = Field(
+        default=None,
+        description="The OAuth client secret paired with oauth_oidc_client_id.",
+    )
+    oauth_oidc_display_name: str | None = Field(
+        default=None,
+        description=(
+            "The sign-in button text, e.g. 'Acme SSO'."
+        ),
+    )
+    oauth_oidc_scopes: str | None = Field(
+        default=None,
+        description=(
+            "Space-separated scopes to request, in place of the default 'openid profile email'. Set this for "
+            "an IdP that gates the email or profile claims behind scopes of its own, or that refuses one of "
+            "the defaults. 'openid' is requested either way: without it the provider runs a plain OAuth flow "
+            "and returns no ID token, which is what a sign-in here establishes an identity from."
+        ),
     )
     mail_transport: str = Field(
         default="auto",
@@ -1387,6 +1430,11 @@ class GatewayConfig(BaseSettings):
         this deployment cannot keep.
         """
         if not self.public_base_url:
+            return None
+        # A generic connection has no fixed endpoints to fall back on, so its
+        # issuer is as load-bearing as either credential half: without it,
+        # discovery has nothing to fetch and the button could not work either.
+        if provider == "oidc" and not self.oauth_oidc_issuer_url:
             return None
         client_id = getattr(self, f"oauth_{provider}_client_id", None)
         client_secret = getattr(self, f"oauth_{provider}_client_secret", None)
@@ -2184,17 +2232,17 @@ class GatewayConfig(BaseSettings):
         for provider in OAUTH_PROVIDERS:
             client_id = getattr(self, f"oauth_{provider}_client_id", None)
             client_secret = getattr(self, f"oauth_{provider}_client_secret", None)
-            if not client_id and not client_secret:
+            issuer_url = self.oauth_oidc_issuer_url if provider == "oidc" else None
+            if not client_id and not client_secret and not issuer_url:
                 continue
-            missing = [
-                name
-                for name, value in (
-                    (f"oauth_{provider}_client_id", client_id),
-                    (f"oauth_{provider}_client_secret", client_secret),
-                    ("public_base_url", self.public_base_url),
-                )
-                if not value
-            ]
+            settings: tuple[tuple[str, str | None], ...] = (
+                (f"oauth_{provider}_client_id", client_id),
+                (f"oauth_{provider}_client_secret", client_secret),
+                ("public_base_url", self.public_base_url),
+            )
+            if provider == "oidc":
+                settings = (*settings, ("oauth_oidc_issuer_url", issuer_url))
+            missing = [name for name, value in settings if not value]
             if missing:
                 logger.warning(
                     "%s sign-in is configured but will not be offered: %s %s not set. "

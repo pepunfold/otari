@@ -130,4 +130,18 @@ describe("PublicAuthPage: the OAuth provider gate", () => {
       screen.getByRole("heading", { name: "That sign-in did not complete" }),
     ).toBeInTheDocument()
   })
+
+  it("renders the callback page for a configured oidc connection", () => {
+    // The gate is the only thing keyed on the provider list; the switch below
+    // it has to carry its own arm for every path the gate lets through, or a
+    // configured provider renders nothing at all.
+    renderPage("/auth/oidc/callback", { oauthProviders: ["oidc"] })
+
+    expect(
+      screen.queryByRole("heading", { name: "Not available on this gateway" }),
+    ).toBeNull()
+    expect(
+      screen.getByRole("heading", { name: "That sign-in did not complete" }),
+    ).toBeInTheDocument()
+  })
 })

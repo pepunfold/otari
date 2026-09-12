@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react"
 import { useAuth } from "@/features/auth/AuthContext"
 import { ApiError, completeOAuthSignIn } from "@/shared/api/client"
 import { errorMessage } from "@/shared/components/feedback/errorMessage"
+import { useDeployment } from "@/shared/hooks/useDeployment"
 import {
   analyticsErrorCode,
   analyticsStatusCode,
@@ -10,7 +11,7 @@ import {
 import { TELEMETRY_EVENTS } from "@/shared/telemetry/events"
 import { useTelemetry } from "@/shared/telemetry/overlayTelemetry"
 
-import { oauthProviderLabel } from "./oauthProviders"
+import { oauthProviderLabelFor } from "./oauthProviders"
 import {
   goToPublicAuthPage,
   PublicAuthLayout,
@@ -83,7 +84,9 @@ export function OAuthCallbackPage({
 }) {
   const { login } = useAuth()
   const { recordEvent } = useTelemetry()
+  const { oauth_oidc_label } = useDeployment()
   const [failure, setFailure] = useState<string | null>(null)
+  const label = oauthProviderLabelFor(provider, oauth_oidc_label)
   // The effect below signs somebody in, so it must run once and not once per
   // render. React's development StrictMode mounts an effect twice on purpose,
   // and the second run would post a code the first already spent, turning every
@@ -96,12 +99,16 @@ export function OAuthCallbackPage({
     }
     startedRef.current = true
 
-    const label = oauthProviderLabel(provider)
     const params = new URLSearchParams(hash.split("?")[1] ?? "")
     const expectedState = takeOAuthState()
     const providerError = params.get("error")
     const state = params.get("state")
     const code = params.get("code")
+    // RFC 9207: present only for a provider whose config carries an issuer,
+    // which today is only a generic OIDC connection, absent for google/github,
+    // and the gateway's own check is then a no-op for both, the same way it
+    // already is server-side (`services/oauth_service.py`).
+    const iss = params.get("iss") ?? undefined
 
     const refuse = (message: string, errorCode: string) => {
       recordEvent(TELEMETRY_EVENTS.LOGIN_FAILED, {
@@ -141,7 +148,7 @@ export function OAuthCallbackPage({
 
     void (async () => {
       try {
-        const result = await completeOAuthSignIn(provider, code, state)
+        const result = await completeOAuthSignIn(provider, code, state, iss)
         if (result.ok) {
           recordEvent(TELEMETRY_EVENTS.LOGIN_SUCCESS, {
             authentication_method: provider,
@@ -171,12 +178,12 @@ export function OAuthCallbackPage({
         setFailure(errorMessage(caught))
       }
     })()
-  }, [provider, hash, login, recordEvent])
+  }, [provider, hash, login, recordEvent, label])
 
   if (failure === null) {
     return (
       <PublicAuthLayout
-        title={`Finishing your ${oauthProviderLabel(provider)} sign-in`}
+        title={`Finishing your ${label} sign-in`}
         description="One moment."
       >
         {/* No spinner: the wait is a single request and a spinner that renders

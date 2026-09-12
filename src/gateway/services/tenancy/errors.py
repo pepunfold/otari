@@ -379,9 +379,13 @@ class OAuthNotConfiguredError(TenancyValidationError):
 
     503 rather than the 400 its base carries, for the reason
     ``PasskeysNotConfiguredError`` gives: nothing is wrong with the request, the
-    deployment is not set up to answer it. The message names the settings,
-    because the only caller who reaches this meant to offer that provider and
-    needs to know which two lines are missing.
+    deployment is not set up to answer it.
+
+    The message names the settings for an operator, who does not read it here:
+    every OAuth route is unauthenticated, so the tenancy error handler's
+    blanking of any status of 500 or above is what keeps the setting names away
+    from whoever asked. ``GatewayConfig.warn_about_half_configured_oauth`` is
+    the channel that does reach an operator, once, at startup.
 
     Reachable at all only because the dashboard hides a provider this deployment
     does not configure: the affordance is absent rather than disabled
@@ -392,10 +396,60 @@ class OAuthNotConfiguredError(TenancyValidationError):
     status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     def __init__(self, provider: str) -> None:
+        # A generic connection needs a fourth setting no preset-backed
+        # provider does: an issuer has no fixed endpoint to fall back on.
+        issuer_setting = " and oauth_oidc_issuer_url" if provider == "oidc" else ""
         super().__init__(
             f"{provider} sign-in is not configured on this deployment. "
-            f"Set oauth_{provider}_client_id and oauth_{provider}_client_secret, and public_base_url, then restart."
+            f"Set oauth_{provider}_client_id and oauth_{provider}_client_secret{issuer_setting}, "
+            "and public_base_url, then restart."
         )
+
+
+class OAuthProviderUnavailableError(TenancyValidationError):
+    """A configured provider's own live dependency could not be reached right now.
+
+    Distinct from ``OAuthNotConfiguredError``: every setting an operator needs
+    to set is set. Raised only for a generic OIDC connection, whose
+    authorization URL cannot be built without first reaching its discovery
+    document; Google's and GitHub's endpoints are constants, so nothing on
+    their path can fail this way. 503 because it may simply work on retry.
+
+    **The message is for a log, not a response.** Every route that raises this
+    is unauthenticated, and the tenancy error handler blanks the body of any
+    status of 500 or above, so a caller is told the status and nothing else.
+    What separates this from ``OAuthProviderUnusableError`` is therefore which
+    line an operator finds in the log, not what anybody reads on a sign-in
+    screen.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(f"{provider} sign-in is temporarily unavailable. Try again shortly.")
+
+
+class OAuthProviderUnusableError(TenancyValidationError):
+    """A configured provider answered, with something this deployment cannot sign in against.
+
+    The other half of ``OAuthProviderUnavailableError``, and the reason the two
+    are separate: retrying fixes nothing here. The discovery document was read
+    and is valid, and what it names is a provider no authorization-code flow of
+    ours can complete (no ``S256`` to negotiate PKCE with, no token-endpoint
+    auth method this deployment can perform). Somebody has to change something
+    at the provider.
+
+    Like its sibling, the wording reaches a log and never a response, and which
+    negotiation actually failed is on the traceback under the log line at the
+    raise. The pair stays split because an operator reading "could not reach
+    the issuer" goes looking somewhere else than one reading "the issuer
+    answered with something unusable".
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(f"{provider} sign-in cannot be completed on this deployment. Ask an operator to check it.")
 
 
 class OAuthExchangeError(TenancyValidationError):

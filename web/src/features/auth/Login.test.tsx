@@ -28,12 +28,14 @@ function Mounted({
   mailReady = false,
   maintenanceMode = false,
   oauthProviders = [],
+  oauthOidcLabel = null,
 }: {
   children: React.ReactNode
   signInMethods?: ("master_key" | "password" | "passkey")[]
   mailReady?: boolean
   maintenanceMode?: boolean
   oauthProviders?: string[]
+  oauthOidcLabel?: string | null
 }) {
   return (
     <AppProviders>
@@ -43,6 +45,7 @@ function Mounted({
           mail_ready: mailReady,
           maintenance_mode: maintenanceMode,
           oauth_providers: oauthProviders,
+          oauth_oidc_label: oauthOidcLabel,
         })}
       >
         {children}
@@ -1134,6 +1137,32 @@ describe("Login with a passkey", () => {
       expect(
         screen.getAllByRole("button", { name: /Sign in with/ }),
       ).toHaveLength(1)
+    })
+
+    it("names the generic connection's button with the operator's own label", () => {
+      render(
+        <Mounted
+          signInMethods={["password"]}
+          oauthProviders={["oidc"]}
+          oauthOidcLabel="Acme SSO"
+        >
+          <Harness />
+        </Mounted>,
+      )
+      expect(
+        screen.getByRole("button", { name: "Sign in with Acme SSO" }),
+      ).toBeInTheDocument()
+    })
+
+    it("falls back to a generic label when the operator set none", () => {
+      render(
+        <Mounted signInMethods={["password"]} oauthProviders={["oidc"]}>
+          <Harness />
+        </Mounted>,
+      )
+      expect(
+        screen.getByRole("button", { name: "Sign in with SSO" }),
+      ).toBeInTheDocument()
     })
 
     it("stores the state the gateway minted, then leaves for the provider", async () => {

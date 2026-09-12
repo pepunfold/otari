@@ -82,6 +82,12 @@ describe("isPublicAuthPageAvailable", () => {
     expect(
       isPublicAuthPageAvailable("/auth/google/callback", NOTHING_CONFIGURED),
     ).toBe(false)
+    expect(
+      isPublicAuthPageAvailable("/auth/oidc/callback", {
+        mailReady: false,
+        oauthProviders: ["oidc"],
+      }),
+    ).toBe(true)
   })
 
   it("does not gate an OAuth callback on mail, which it never sends", () => {
@@ -98,6 +104,7 @@ describe("oauthCallbackProvider", () => {
   it("names the provider an OAuth callback path finishes", () => {
     expect(oauthCallbackProvider("/auth/google/callback")).toBe("google")
     expect(oauthCallbackProvider("/auth/github/callback")).toBe("github")
+    expect(oauthCallbackProvider("/auth/oidc/callback")).toBe("oidc")
   })
 
   it("answers null for every page that is not one", () => {

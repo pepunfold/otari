@@ -1,0 +1,43 @@
+{
+  "realm": "otari-test",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 300,
+  "users": [
+    {
+      "username": "ada",
+      "email": "ada@example.com",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Ada",
+      "lastName": "Lovelace",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "a-real-password",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "otari-gateway",
+      "name": "otari-gateway",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "otari-test-client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://testserver/auth/oidc/callback"],
+      "webOrigins": ["http://testserver"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    }
+  ]
+}

@@ -17,17 +17,61 @@ import logging
 from collections.abc import Generator
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from apron_auth import OAuthClient
+from apron_auth.errors import ConfigurationError, IdentityFetchError, OidcDiscoveryError
+from apron_auth.models import ServerMetadata, TokenSet
 from apron_auth.providers import github as apron_github
 from apron_auth.providers import google as apron_google
+from apron_auth.providers import oidc as apron_oidc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.core.config import OAUTH_PROVIDERS, GatewayConfig
 from gateway.log_config import logger as gateway_logger
 from gateway.services import oauth_service
-from gateway.services.tenancy.errors import OAuthExchangeError, OAuthNotConfiguredError, OAuthStateError
+from gateway.services.tenancy.errors import (
+    OAuthExchangeError,
+    OAuthNotConfiguredError,
+    OAuthProviderUnavailableError,
+    OAuthProviderUnusableError,
+    OAuthStateError,
+)
+
+# Providers apron-auth ships a fixed preset for: hardcoded endpoints, no
+# discovery. ``oidc`` has none of that by design (an operator's own issuer
+# cannot be a compile-time constant), so a test about preset internals
+# specifically does not extend to it; those are parametrized over this
+# narrower tuple rather than the full ``OAUTH_PROVIDERS``.
+_PRESET_PROVIDERS = ("google", "github")
+
+OIDC_METADATA = ServerMetadata(
+    issuer="https://idp.example.com",
+    authorize_url="https://idp.example.com/authorize",
+    token_url="https://idp.example.com/token",
+    jwks_url="https://idp.example.com/jwks",
+    userinfo_url="https://idp.example.com/userinfo",
+    code_challenge_methods=["S256"],
+    token_endpoint_auth_methods=["client_secret_post"],
+    iss_parameter_supported=True,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_oidc_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test in this module gets a discoverable ``oidc`` connection with no network.
+
+    Google's and GitHub's authorization URLs are built from apron-auth's own
+    constants, so building one has never needed the network in this file.
+    Building one for ``oidc`` does (discovery is the whole point), so this
+    is what keeps that difference from leaking into every test that exercises
+    all three providers alike. Discovery itself is apron-auth's, and covered
+    there; ``tests/integration/test_oidc_keycloak.py`` is where this
+    deployment exercises it unstubbed against a real provider.
+    """
+    monkeypatch.setattr(apron_oidc, "discover", AsyncMock(return_value=OIDC_METADATA))
 
 
 class FakeSession:
@@ -70,15 +114,32 @@ async def authorize(config: GatewayConfig, provider: str) -> tuple[str, str]:
 
 
 def configured(**overrides: Any) -> GatewayConfig:
-    """A deployment with both providers registered and an address of its own."""
+    """A deployment with all three providers registered and an address of its own."""
     settings: dict[str, Any] = {
         "public_base_url": "https://otari.example.com",
         "oauth_google_client_id": "google-id",
         "oauth_google_client_secret": "google-secret",
         "oauth_github_client_id": "github-id",
         "oauth_github_client_secret": "github-secret",
+        "oauth_oidc_issuer_url": "https://idp.example.com",
+        "oauth_oidc_client_id": "oidc-id",
+        "oauth_oidc_client_secret": "oidc-secret",
     }
     return GatewayConfig(**(settings | overrides))
+
+
+@pytest.fixture(autouse=True)
+def _forget_discovered_documents() -> Generator[None]:
+    """Empty the process-lifetime discovery cache around every test.
+
+    ``oauth_service`` reads an OIDC discovery document once and keeps it, which
+    is right for a running deployment and wrong across tests: a document cached
+    by one would be served to the next, which then never reaches the ``discover``
+    stub it installed.
+    """
+    oauth_service._forget_discovered()
+    yield
+    oauth_service._forget_discovered()
 
 
 class TestWhichProvidersAreOnOffer:
@@ -106,7 +167,7 @@ class TestWhichProvidersAreOnOffer:
         assert config.oauth_providers == ()
 
     def test_providers_are_sorted_so_the_sign_in_screen_is_stable(self) -> None:
-        assert configured().oauth_providers == ("github", "google")
+        assert configured().oauth_providers == ("github", "google", "oidc")
 
     def test_one_configured_provider_does_not_offer_the_other(self) -> None:
         config = GatewayConfig(
@@ -167,6 +228,55 @@ class TestHalfConfiguredOAuthIsAnnounced:
             config.warn_about_half_configured_oauth()
 
         assert "oauth_github_client_secret" in caplog.text
+
+    def test_a_missing_oidc_issuer_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The fourth setting no preset-backed provider has, so it is the one an
+        # operator coming from the Google or GitHub instructions will miss.
+        config = GatewayConfig(
+            public_base_url="https://otari.example.com",
+            oauth_oidc_client_id="oidc-id",
+            oauth_oidc_client_secret="oidc-secret",  # noqa: S106
+        )
+
+        with caplog.at_level(logging.WARNING, logger="gateway"):
+            config.warn_about_half_configured_oauth()
+
+        assert "oauth_oidc_issuer_url" in caplog.text
+
+    def test_an_issuer_with_no_credentials_is_not_mistaken_for_silence(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An issuer alone is a configured connection, even with neither credential set.
+
+        The credential pair is what decides that for every other provider, and
+        reading only the pair here would skip this deployment as one that
+        configured nothing, which is the one case where a warning is most
+        wanted: the operator has started.
+        """
+        config = GatewayConfig(
+            public_base_url="https://otari.example.com",
+            oauth_oidc_issuer_url="https://idp.example.com",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="gateway"):
+            config.warn_about_half_configured_oauth()
+
+        assert "oauth_oidc_client_id" in caplog.text
+        assert "oauth_oidc_client_secret" in caplog.text
+
+    def test_one_half_configured_provider_does_not_implicate_the_others(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Per provider, not per deployment: naming a connection nobody touched
+        # would send an operator to look at settings they never set.
+        config = GatewayConfig(oauth_google_client_id="google-id")
+
+        with caplog.at_level(logging.WARNING, logger="gateway"):
+            config.warn_about_half_configured_oauth()
+
+        assert "google" in caplog.text
+        assert "oidc" not in caplog.text
+        assert "github" not in caplog.text
 
     def test_a_deployment_that_configured_nothing_says_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
         # The ordinary state, not a mistake: warning here would put a line in
@@ -246,13 +356,15 @@ class TestAuthorizationUrl:
         assert query["client_id"] == ["github-id"]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider", OAUTH_PROVIDERS)
+    @pytest.mark.parametrize("provider", _PRESET_PROVIDERS)
     async def test_the_preset_does_not_widen_the_scopes(self, provider: str) -> None:
         # Each preset merges its own BASE_SCOPES over what it is given, which
         # for Google adds the long-form userinfo.email next to the `email`
         # already asked for. It grants nothing new and names a scope this
         # gateway did not choose on the consent screen, so `_as_configured_here`
         # pins the set. Nothing read this field while the URL was hand-built.
+        # Not parametrized over "oidc": that connection's scopes are the
+        # operator's to replace, per oauth_oidc_scopes; see TestOidcScopes.
         url, _ = await authorize(configured(), provider)
         query = parse_qs(urlsplit(url).query)
 
@@ -380,11 +492,13 @@ class TestState:
 
 
 class TestPkce:
-    @pytest.mark.parametrize("provider", OAUTH_PROVIDERS)
+    @pytest.mark.parametrize("provider", _PRESET_PROVIDERS)
     def test_the_preset_asks_for_it_and_this_flow_leaves_that_alone(self, provider: str) -> None:
         # apron-auth's own default, which otari#765 cleared and this restores.
         # Asserted against the preset rather than the URL so a later release
         # flipping the default cannot pass unnoticed behind a green suite.
+        # oidc has no preset to assert this against; TestAuthorizationUrl's
+        # test_a_code_challenge_is_sent covers PKCE on its actual URL instead.
         preset = apron_google.preset if provider == "google" else apron_github.preset
         provider_config, _ = preset(
             client_id="id",
@@ -408,7 +522,10 @@ class TestExchange:
             async def fetch_identity(self, _tokens: object) -> Any:
                 return profile
 
-        monkeypatch.setattr(oauth_service, "_client", lambda *_args, **_kwargs: _Client())
+        async def _client(*_args: Any, **_kwargs: Any) -> _Client:
+            return _Client()
+
+        monkeypatch.setattr(oauth_service, "_client", _client)
 
     @staticmethod
     def _profile(**overrides: Any) -> SimpleNamespace:
@@ -472,7 +589,10 @@ class TestExchange:
             async def fetch_identity(self, _tokens: object) -> Any:  # pragma: no cover - never reached
                 raise AssertionError
 
-        monkeypatch.setattr(oauth_service, "_client", lambda *_a, **_k: _Client())
+        async def _client(*_a: Any, **_k: Any) -> _Client:
+            return _Client()
+
+        monkeypatch.setattr(oauth_service, "_client", _client)
 
         with pytest.raises(OAuthExchangeError) as caught:
             await oauth_service.exchange_code(
@@ -493,7 +613,10 @@ class TestExchange:
             async def fetch_identity(self, _tokens: object) -> Any:
                 raise RuntimeError("userinfo 500")
 
-        monkeypatch.setattr(oauth_service, "_client", lambda *_a, **_k: _Client())
+        async def _client(*_a: Any, **_k: Any) -> _Client:
+            return _Client()
+
+        monkeypatch.setattr(oauth_service, "_client", _client)
 
         with pytest.raises(OAuthExchangeError):
             await oauth_service.exchange_code(
@@ -516,6 +639,283 @@ class TestExchange:
                 flow_secret=FLOW_SECRET,
                 db=fake_db(),
             )
+
+
+class TestOidcConnection:
+    """The generic connection's own pieces: discovery, and scopes an operator can replace."""
+
+    @pytest.mark.asyncio
+    async def test_the_authorization_url_is_built_from_what_discovery_returned(self) -> None:
+        url, _ = await authorize(configured(), "oidc")
+
+        # The endpoint is the discovered one, not a constant: a preset provider
+        # could pass this by hardcoding, and oidc has nothing to hardcode.
+        assert url.startswith(f"{OIDC_METADATA.authorize_url}?")
+
+    @pytest.mark.asyncio
+    async def test_pkce_is_on_and_the_row_keeps_the_verifier(self) -> None:
+        session = FakeSession()
+        url, _ = await oauth_service.authorization_url(
+            configured(), "oidc", db=cast("AsyncSession", session), flow_secret=FLOW_SECRET
+        )
+        query = parse_qs(urlsplit(url).query)
+        (row,) = session.added
+
+        # With no nonce, PKCE is the only thing binding the code to this
+        # browser, so its presence is load-bearing rather than incidental.
+        assert query["code_challenge_method"] == ["S256"]
+        assert query["code_challenge"]
+        assert row.code_verifier
+
+    @pytest.mark.asyncio
+    async def test_the_default_set_is_what_an_identity_is_built_from(self) -> None:
+        url, _ = await authorize(configured(), "oidc")
+
+        # Sorted, because apron-auth merges its own ``openid`` in and returns
+        # the union ordered; scope order carries no meaning to a provider.
+        assert parse_qs(urlsplit(url).query)["scope"] == ["email openid profile"]
+
+    @pytest.mark.asyncio
+    async def test_what_an_operator_configures_replaces_the_default_set(self) -> None:
+        """Replaced, not added to: an IdP that refuses ``profile`` has to be able to drop it."""
+        url, _ = await authorize(configured(oauth_oidc_scopes="groups"), "oidc")
+
+        assert parse_qs(urlsplit(url).query)["scope"] == ["groups openid"]
+
+    @pytest.mark.asyncio
+    async def test_openid_survives_an_operator_who_asks_for_nothing(self) -> None:
+        """``openid`` is not the operator's to drop: without it there is no ID token."""
+        url, _ = await authorize(configured(oauth_oidc_scopes=""), "oidc")
+
+        assert parse_qs(urlsplit(url).query)["scope"] == ["openid"]
+
+    @pytest.mark.asyncio
+    async def test_a_discovery_failure_is_distinct_from_not_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def _broken_discover(*_a: Any, **_k: Any) -> Any:
+            raise OidcDiscoveryError("issuer unreachable")
+
+        monkeypatch.setattr(apron_oidc, "discover", _broken_discover)
+
+        with pytest.raises(OAuthProviderUnavailableError) as caught:
+            await authorize(configured(), "oidc")
+
+        # Every setting is in fact set here, so telling the operator to "set"
+        # one would be the wrong message; that wording is
+        # OAuthNotConfiguredError's alone.
+        assert "Set oauth_oidc" not in caught.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_provider_we_cannot_negotiate_with_is_distinct_from_an_outage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Discovery answered; what it named is unusable, and no retry changes that."""
+
+        def _unusable_preset(*_a: Any, **_k: Any) -> Any:
+            raise ConfigurationError("advertises no S256 code-challenge method")
+
+        monkeypatch.setattr(apron_oidc, "preset", _unusable_preset)
+
+        with pytest.raises(OAuthProviderUnusableError) as caught:
+            await authorize(configured(), "oidc")
+
+        assert "Try again" not in caught.value.message
+
+    @pytest.mark.asyncio
+    async def test_a_bug_here_is_not_laundered_into_a_provider_refusal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reason the catch names two error types rather than ``Exception``.
+
+        A refusal means "the provider did something": rendering our own bug as
+        one sends an operator to look at an IdP that is working fine, and hides
+        a 500 that should have been one.
+        """
+
+        def _raises_a_bug(*_a: Any, **_k: Any) -> Any:
+            raise TypeError("a mistake in this module, not the provider's doing")
+
+        monkeypatch.setattr(apron_oidc, "preset", _raises_a_bug)
+
+        with pytest.raises(TypeError):
+            await authorize(configured(), "oidc")
+
+    @pytest.mark.asyncio
+    async def test_the_providers_own_reason_is_logged_where_an_operator_reads_it(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The route renders these itself, so this is the only place the reason is written down."""
+
+        async def _broken_discover(*_a: Any, **_k: Any) -> Any:
+            raise OidcDiscoveryError("issuer unreachable")
+
+        monkeypatch.setattr(apron_oidc, "discover", _broken_discover)
+
+        # ``gateway`` does not propagate (``log_config.setup_logging``), so
+        # caplog's own handler has to be attached to it, the way
+        # ``TestHalfConfiguredOAuthIsAnnounced`` above already does.
+        gateway_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.WARNING, logger=gateway_logger.name), pytest.raises(
+                OAuthProviderUnavailableError
+            ):
+                await authorize(configured(), "oidc")
+        finally:
+            gateway_logger.removeHandler(caplog.handler)
+
+        assert "OIDC discovery" in caplog.text
+        # The provider's own reason, which the response deliberately omits.
+        assert "issuer unreachable" in caplog.text
+
+
+    @pytest.mark.asyncio
+    async def test_the_document_is_read_once_and_then_reused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Discovery is a per-process read, not a per-sign-in one.
+
+        Without this the outbound round trip sits in front of ``/authorize``
+        and ``/callback`` both, on every attempt, and both are public.
+        """
+        discover = AsyncMock(return_value=OIDC_METADATA)
+        monkeypatch.setattr(apron_oidc, "discover", discover)
+
+        await authorize(configured(), "oidc")
+        await authorize(configured(), "oidc")
+
+        assert discover.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_another_issuer_is_not_served_the_first_ones_document(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Keyed by what it was fetched for, rather than one slot for whatever came first."""
+        discover = AsyncMock(return_value=OIDC_METADATA)
+        monkeypatch.setattr(apron_oidc, "discover", discover)
+
+        await authorize(configured(), "oidc")
+        await authorize(configured(oauth_oidc_issuer_url="https://elsewhere.example.com"), "oidc")
+
+        assert discover.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_relocated_document_is_fetched_rather_than_assumed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The override belongs in the key too: same issuer, different document URL.
+
+        ``oauth_oidc_discovery_url`` exists for an IdP that does not serve its
+        document at the standard suffix, so two deployments of one issuer can
+        read it from two places.
+        """
+        discover = AsyncMock(return_value=OIDC_METADATA)
+        monkeypatch.setattr(apron_oidc, "discover", discover)
+
+        await authorize(configured(), "oidc")
+        await authorize(configured(oauth_oidc_discovery_url="https://idp.example.com/oidc.json"), "oidc")
+
+        assert discover.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_is_not_remembered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An IdP that was down when somebody first pressed the button is tried again.
+
+        The alternative is a cache that turns one outage into a sign-in that
+        stays broken until the process restarts.
+        """
+        attempts = 0
+
+        async def _unreachable_once(*_a: Any, **_k: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OidcDiscoveryError("issuer unreachable")
+            return OIDC_METADATA
+
+        monkeypatch.setattr(apron_oidc, "discover", _unreachable_once)
+
+        with pytest.raises(OAuthProviderUnavailableError):
+            await authorize(configured(), "oidc")
+        url, _ = await authorize(configured(), "oidc")
+
+        assert attempts == 2
+        assert url.startswith(f"{OIDC_METADATA.authorize_url}?")
+
+
+class TestOidcExchange:
+    """``exchange_code`` for ``oidc``: that the handler is built from what was discovered.
+
+    The ID token's own claim validation is apron-auth's
+    (``OidcIdentityHandler``) and covered there, unstubbed against a real
+    provider in ``tests/integration/test_oidc_keycloak.py``. What matters here
+    is the wiring: that the issuer the handler checks against is the
+    *discovered* one and the audience is this deployment's own client ID, since
+    a handler built from either wrong value would validate happily and vouch
+    for the wrong person.
+    """
+
+    @staticmethod
+    def _stub_exchange(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Answer the token endpoint without one, leaving the identity wiring real."""
+
+        async def _exchange_code(_self: Any, **_: Any) -> Any:
+            # Where a provider's own ID token lands: the token endpoint returns it
+            # as an ordinary field, which ``TokenSet`` collects into ``metadata`` and
+            # ``IdentityMaterial.from_tokens`` reads back out.
+            return TokenSet(access_token="at", metadata={"id_token": "header.payload.signature"})  # noqa: S106
+
+        monkeypatch.setattr(OAuthClient, "exchange_code", _exchange_code)
+
+    @pytest.mark.asyncio
+    async def test_the_handler_checks_the_discovered_issuer_and_this_clients_audience(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_exchange(monkeypatch)
+        captured: dict[str, Any] = {}
+
+        def _identity_handler(metadata: Any, **kwargs: Any) -> Any:
+            captured["issuer"] = metadata.issuer
+            captured.update(kwargs)
+
+            class _Handler:
+                async def fetch_identity(self, _material: Any, _config: Any) -> Any:
+                    return SimpleNamespace(email="ada@example.com", name="Ada Lovelace", email_verified=True)
+
+            return _Handler()
+
+        monkeypatch.setattr(apron_oidc, "identity_handler", _identity_handler)
+
+        identity = await oauth_service.exchange_code(
+            configured(), "oidc", code="c", state="s", flow_secret=FLOW_SECRET, db=fake_db()
+        )
+
+        assert captured["issuer"] == OIDC_METADATA.issuer
+        assert captured["client_id"] == "oidc-id"
+        # The route's provider name, not the ``oidc:<issuer>`` one apron-auth
+        # namespaces its profiles with: what crosses IdentityProviderPort is
+        # this deployment's own provider string.
+        assert identity.provider == "oidc"
+        assert identity.email == "ada@example.com"
+
+    @pytest.mark.asyncio
+    async def test_an_id_token_that_does_not_validate_is_an_exchange_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_exchange(monkeypatch)
+
+        def _identity_handler(*_a: Any, **_k: Any) -> Any:
+            class _Handler:
+                async def fetch_identity(self, _material: Any, _config: Any) -> Any:
+                    raise IdentityFetchError("OpenID ID token claims did not validate: aud")
+
+            return _Handler()
+
+        monkeypatch.setattr(apron_oidc, "identity_handler", _identity_handler)
+
+        with pytest.raises(OAuthExchangeError) as caught:
+            await oauth_service.exchange_code(
+                configured(), "oidc", code="c", state="s", flow_secret=FLOW_SECRET, db=fake_db()
+            )
+
+        # The provider's own words stay on the traceback, not in the response.
+        assert "aud" not in caught.value.message
 
 
 class TestProviderLabel:

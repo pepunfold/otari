@@ -142,7 +142,7 @@ Passkeys are optional and additive to password sign-in. Set
 Changing the relying-party ID makes existing passkeys unusable. The dashboard
 continues listing unusable credentials so the owner can remove them.
 
-### OAuth sign-in (Google and GitHub)
+### OAuth sign-in (Google, GitHub, and any OpenID Connect provider)
 
 OAuth sign-in requires `public_base_url` and the provider's client ID and
 secret. Register this redirect URI with the provider:
@@ -151,8 +151,42 @@ secret. Register this redirect URI with the provider:
 {public_base_url}/auth/{provider}/callback
 ```
 
+`{provider}` is `google`, `github`, or `oidc`. A provider missing any of its
+settings is absent from the sign-in screen rather than offered and then refused.
+
 OAuth signs in an existing Otari identity whose email the provider verifies. It
 does not provision arbitrary provider accounts.
+
+#### Generic OpenID Connect
+
+The `oidc` connection signs in against any standards-conformant OpenID Connect
+provider (Keycloak, Okta, Entra ID, Auth0, and others). It needs one setting the
+other two do not, `oauth_oidc_issuer_url`, because it has no fixed endpoints to
+fall back on:
+
+| Setting | Required | What it is |
+| --- | --- | --- |
+| `oauth_oidc_issuer_url` | yes | The provider's issuer, for example `https://keycloak.example.com/realms/otari`. Discovery reads `{issuer}/.well-known/openid-configuration`. |
+| `oauth_oidc_client_id` | yes | The client this deployment authenticates as. |
+| `oauth_oidc_client_secret` | yes | The secret paired with it. This is a confidential client. |
+| `oauth_oidc_display_name` | no | The sign-in button's text, for example `Acme SSO`. Without it the button reads "Sign in with SSO". |
+| `oauth_oidc_scopes` | no | Scopes to request in place of the default `openid profile email`. `openid` is requested either way. |
+| `oauth_oidc_discovery_url` | no | Where the discovery document lives, when the provider does not serve it at the standard suffix. |
+
+The issuer is the trust anchor, not just an address. It must be the value the
+provider's own discovery document names as its issuer: every ID token's `iss`,
+and the RFC 9207 `iss` on the authorization response, are checked against it.
+Register the client as confidential, with `{public_base_url}/auth/oidc/callback`
+as its one redirect URI, and leave PKCE enabled; Otari sends no `nonce`, so PKCE
+is the only thing binding an authorization code to the browser that asked for
+it, and a provider that cannot negotiate `S256` is refused rather than
+configured without it.
+
+Discovery happens at sign-in, so an unreachable provider fails the sign-in with
+a 503 and needs no configuration change once it recovers. A provider that
+answers but that Otari cannot negotiate with, the `S256` case above among them,
+fails with a 503 that says so instead: retrying will not help, and the reason is
+in the gateway log.
 
 ## Invitations
 

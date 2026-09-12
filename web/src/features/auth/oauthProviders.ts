@@ -1,6 +1,7 @@
 import type { IconType } from "react-icons"
 import { FaGithub } from "react-icons/fa"
 import { FcGoogle } from "react-icons/fc"
+import { FiLogIn } from "react-icons/fi"
 
 /**
  * The OAuth providers this dashboard can sign in with, and what to call them.
@@ -18,26 +19,39 @@ import { FcGoogle } from "react-icons/fc"
  */
 
 /** A provider name the gateway and this dashboard both know. */
-export type OAuthProvider = "github" | "google"
+export type OAuthProvider = "github" | "google" | "oidc"
 
-/** How each provider writes its own name. */
+/**
+ * How each provider writes its own name.
+ *
+ * `oidc`'s entry is a generic fallback, not a brand name: a generic
+ * connection has none of its own, which is why the bootstrap carries
+ * `oauth_oidc_label` for an operator to supply one (`useDeployment()`,
+ * read where a button is actually rendered). This map is what is left once
+ * that is unset, and what every caller with no deployment context to read
+ * from uses instead: `OAuthCallbackPage`'s error copy, for one.
+ */
 export const OAUTH_PROVIDER_LABELS: Record<OAuthProvider, string> = {
   github: "GitHub",
   google: "Google",
+  oidc: "SSO",
 }
 
 /**
  * Each provider's own mark, for the button that signs in with it.
  *
- * The same two marks `otari-ai/frontend`'s login route uses, from the
- * `react-icons` sets this dashboard already draws its nav from: `Fc` is the
- * full-color Google G, and `Fa` the GitHub logo. Brand marks rather than a
- * generic glyph, because a person scans a sign-in screen for the logo of the
- * account they hold before they read any of the labels.
+ * `Fc`/`Fa` are the same two marks `otari-ai/frontend`'s login route uses,
+ * from the `react-icons` sets this dashboard already draws its nav from:
+ * `Fc` is the full-color Google G, and `Fa` the GitHub logo. `oidc` gets no
+ * brand mark of its own (an operator's own IdP is not one this dashboard
+ * could draw), so it uses `react-icons/fi`'s generic sign-in glyph instead,
+ * the icon set `web/AGENTS.md` reserves for exactly this (an icon that is
+ * not standing in for a specific brand).
  */
 export const OAUTH_PROVIDER_ICONS: Record<OAuthProvider, IconType> = {
   github: FaGithub,
   google: FcGoogle,
+  oidc: FiLogIn,
 }
 
 /**
@@ -63,4 +77,22 @@ export function renderableOAuthProviders(
 /** How to name a provider in a sentence, falling back to the raw name. */
 export function oauthProviderLabel(provider: string): string {
   return isOAuthProvider(provider) ? OAUTH_PROVIDER_LABELS[provider] : provider
+}
+
+/**
+ * The same, for a caller that can read the bootstrap.
+ *
+ * Every other provider's name is a brand name this dashboard already knows.
+ * `oidc`'s is whichever IdP an operator pointed it at, which only the bootstrap
+ * can say (`oauth_oidc_label`), so it is threaded in rather than looked up. An
+ * older gateway that carries no such field, and an operator who set none, both
+ * land on the generic entry in `OAUTH_PROVIDER_LABELS`.
+ */
+export function oauthProviderLabelFor(
+  provider: string,
+  oidcLabel: string | null | undefined,
+): string {
+  return provider === "oidc" && oidcLabel
+    ? oidcLabel
+    : oauthProviderLabel(provider)
 }

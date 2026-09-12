@@ -151,6 +151,9 @@ export function bootstrap(
     // the OAuth tests name the providers they need rather than every other test
     // clearing a list it does not care about.
     oauth_providers: [],
+    // Null, matching a deployment that never reaches oidc's own branch in
+    // oauth_providers: the OAuth tests that name "oidc" set their own label.
+    oauth_oidc_label: null,
     mail_ready: false,
     ...overrides,
   }

@@ -90,16 +90,37 @@ describe("OAuthCallbackPage", () => {
     expect(url).toBe("/v1/auth/oauth/google/callback")
     // The code and the state, and no redirect URI: that one is the gateway's
     // own. The state goes back so the gateway can check it against the pending
-    // authorization it recorded, which is the half this tab cannot do.
+    // authorization it recorded, which is the half this tab cannot do. No
+    // `iss` either: google's redirect carried none.
     expect(JSON.parse(String(init?.body))).toEqual({
       code: "the-code",
       state: "the-state",
+      iss: null,
     })
     await waitFor(() =>
       expect(recordEvent).toHaveBeenCalledWith(TELEMETRY_EVENTS.LOGIN_SUCCESS, {
         authentication_method: "google",
       }),
     )
+  })
+
+  it("carries the RFC 9207 iss a provider's redirect appends, when it sent one", async () => {
+    window.sessionStorage.setItem(STATE_KEY, "the-state")
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse({ expires_at: "2026-09-01T00:00:00Z" }))
+
+    renderCallback(
+      "#/auth/oidc/callback?code=the-code&state=the-state&iss=https%3A%2F%2Fidp.example.com",
+    )
+
+    expect(await screen.findByText("SIGNED IN")).toBeInTheDocument()
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    expect(JSON.parse(String(init?.body))).toEqual({
+      code: "the-code",
+      state: "the-state",
+      iss: "https://idp.example.com",
+    })
   })
 
   it("clears the stored state, so one value answers exactly one callback", async () => {

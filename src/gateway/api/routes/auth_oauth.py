@@ -71,7 +71,7 @@ from gateway.services.oauth_service import (
     provider_label,
     require_configured,
 )
-from gateway.services.tenancy.errors import OAuthNotConfiguredError, TenancyError
+from gateway.services.tenancy.errors import TenancyError
 from gateway.services.tenancy.organization_domain_service import OrganizationDomainService
 
 router = APIRouter(prefix="/v1/auth/oauth", tags=["auth"])
@@ -149,6 +149,15 @@ class OAuthCallbackRequest(BaseModel):
         max_length=_MAX_SUBMITTED_STATE,
         description="The 'state' from the provider's redirect, as issued by /authorize.",
     )
+    iss: str | None = Field(
+        default=None,
+        max_length=2048,
+        description=(
+            "The RFC 9207 'iss' from the provider's redirect, when it sent one. Checked against this "
+            "provider's own issuer before the state is even consumed; absent for a provider whose "
+            "config carries no issuer, which is every one but a generic OIDC connection."
+        ),
+    )
 
 
 class OAuthSessionResponse(BaseModel):
@@ -169,7 +178,7 @@ def require_oauth_provider(
     provider: ProviderPath,
     config: Annotated[GatewayConfig, Depends(get_config)],
 ) -> None:
-    """Refuse a provider this deployment did not configure, and say which settings.
+    """Refuse a provider this deployment did not configure.
 
     A dependency rather than a check inside each handler, and ahead of both, for
     two reasons. It answers before the throttle and before the maintenance-mode
@@ -178,16 +187,17 @@ def require_oauth_provider(
     offer" one decision rather than a property of whichever call happened to
     look first, which is what let a stubbed exchange hide it.
 
-    Rendered here rather than left to the tenancy error handler, for the reason
-    ``auth_webauthn.require_passkey_support`` gives: that handler blanks the
-    message of every error carrying a status of 500 or above, which is right for
-    an operator problem the caller cannot act on and wrong for this one, where
-    the missing settings are exactly what the operator needs to read.
+    **Says nothing about why.** Every route here is unauthenticated, so which
+    settings an operator missed would be answered to whoever asked, and the
+    status alone is all a caller can act on anyway. The error carries the
+    settings for a reader that is not the caller: the tenancy error handler
+    blanks the body of every status of 500 or above, and it is
+    ``GatewayConfig.warn_about_half_configured_oauth`` that names them, once, in
+    the startup log. Deliberately not logged per request either, since this
+    answers ahead of the throttle and would be a line an unauthenticated caller
+    can mint at will.
     """
-    try:
-        require_configured(config, provider)
-    except OAuthNotConfiguredError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from None
+    require_configured(config, provider)
 
 
 @router.get(
@@ -277,7 +287,7 @@ async def callback(
         )
     try:
         external = await exchange_code(
-            config, provider, code=body.code, state=body.state, flow_secret=flow_cookie, db=db
+            config, provider, code=body.code, state=body.state, flow_secret=flow_cookie, db=db, iss=body.iss
         )
         identity = await identity_provider.resolve(
             provider=external.provider,

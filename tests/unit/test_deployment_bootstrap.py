@@ -109,8 +109,45 @@ def test_standalone_reports_a_local_operator_and_the_full_surface_set(tmp_path: 
         "maintenance_mode": False,
         "passkeys_ready": False,
         "oauth_providers": [],
+        "oauth_oidc_label": None,
         "mail_ready": False,
     }
+
+
+def test_oauth_oidc_label_carries_the_operators_own_button_text(tmp_path: Path) -> None:
+    config = GatewayConfig(
+        database_url=f"sqlite:///{tmp_path / 'bootstrap.db'}",
+        master_key=MASTER_KEY,
+        public_base_url="https://otari.example.com",
+        oauth_oidc_issuer_url="https://idp.example.com",
+        oauth_oidc_client_id="oidc-id",
+        oauth_oidc_client_secret="oidc-secret",  # noqa: S106
+        oauth_oidc_display_name="Acme SSO",
+    )
+    app = create_app(config)
+
+    with TestClient(app) as client:
+        answered = client.get("/v1/bootstrap").json()
+
+    assert answered["oauth_providers"] == ["oidc"]
+    assert answered["oauth_oidc_label"] == "Acme SSO"
+
+
+def test_oauth_oidc_label_is_null_when_the_provider_is_not_offered(tmp_path: Path) -> None:
+    # Set but incomplete: no issuer, so oidc never reaches oauth_providers and
+    # the label an operator half-configured must not leak out ahead of it.
+    config = GatewayConfig(
+        database_url=f"sqlite:///{tmp_path / 'bootstrap.db'}",
+        master_key=MASTER_KEY,
+        oauth_oidc_display_name="Acme SSO",
+    )
+    app = create_app(config)
+
+    with TestClient(app) as client:
+        answered = client.get("/v1/bootstrap").json()
+
+    assert answered["oauth_providers"] == []
+    assert answered["oauth_oidc_label"] is None
 
 
 def test_a_database_outage_reports_no_sign_in_rather_than_failing(
@@ -345,6 +382,7 @@ def test_hybrid_reports_no_session_no_surfaces_and_the_hosted_url(monkeypatch: p
         "maintenance_mode": False,
         "passkeys_ready": False,
         "oauth_providers": [],
+        "oauth_oidc_label": None,
         "mail_ready": False,
     }
 

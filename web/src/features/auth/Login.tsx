@@ -25,7 +25,7 @@ import { useTelemetry } from "@/shared/telemetry/overlayTelemetry"
 import { rememberOAuthState } from "./OAuthCallbackPage"
 import {
   OAUTH_PROVIDER_ICONS,
-  oauthProviderLabel,
+  oauthProviderLabelFor,
   renderableOAuthProviders,
 } from "./oauthProviders"
 import { AuthPageShell, PublicAuthLink } from "./PublicAuthLayout"
@@ -221,8 +221,13 @@ function LabelRow({
 export function Login() {
   const { login, isSigningOut } = useAuth()
   const { recordEvent } = useTelemetry()
-  const { sign_in_methods, mail_ready, maintenance_mode, oauth_providers } =
-    useDeployment()
+  const {
+    sign_in_methods,
+    mail_ready,
+    maintenance_mode,
+    oauth_providers,
+    oauth_oidc_label,
+  } = useDeployment()
   const usesPassword = sign_in_methods.includes("password")
   // An empty list is the gateway saying it cannot mint a session at all right
   // now. Two ways to get there: `/v1/bootstrap` answers [] when it cannot reach
@@ -251,6 +256,8 @@ export function Login() {
   // connection this build never named), and a provider with no label here would
   // become a button with no name.
   const oauthProviders = renderableOAuthProviders(oauth_providers)
+  const labelFor = (provider: string) =>
+    oauthProviderLabelFor(provider, oauth_oidc_label)
 
   const [masterKey, setMasterKey] = useState("")
   const [isKeyVisible, setIsKeyVisible] = useState(false)
@@ -515,7 +522,7 @@ export function Login() {
         fail(
           usesPassword ? "password" : "masterKey",
           started.message ??
-            `${oauthProviderLabel(provider)} sign-in is not available on this gateway.`,
+            `${labelFor(provider)} sign-in is not available on this gateway.`,
         )
         setPendingProvider(null)
         return
@@ -831,7 +838,7 @@ export function Login() {
                   )}
                   {isRedirecting
                     ? "Redirecting…"
-                    : `Sign in with ${oauthProviderLabel(provider)}`}
+                    : `Sign in with ${labelFor(provider)}`}
                 </Button>
               )
             })}

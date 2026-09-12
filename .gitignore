@@ -15,6 +15,9 @@ build/
 config.yml
 !.github/ISSUE_TEMPLATE/config.yml
 config.yaml
+# Left behind by scripts/dev_keycloak.sh.
+otari-oidc-dev.db
+.otari-dev-keycloak-realm.json
 service_account.json
 gateway.db
 otari-gateway.db

@@ -206,7 +206,14 @@ def test_an_oauth_sign_in_joins_the_organization_that_proved_the_domain(
     monkeypatch.setattr(test_config, "oauth_google_client_secret", "google-secret")
 
     async def _exchange(
-        _config: GatewayConfig, provider: str, *, code: str, state: str, flow_secret: str | None, db: Any
+        _config: GatewayConfig,
+        provider: str,
+        *,
+        code: str,
+        state: str,
+        flow_secret: str | None,
+        db: Any,
+        iss: str | None = None,
     ) -> OAuthIdentity:
         return OAuthIdentity(provider=provider, email=ADDRESS, full_name="Ada", email_verified=True)
 

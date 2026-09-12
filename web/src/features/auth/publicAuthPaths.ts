@@ -75,6 +75,7 @@ export const PUBLIC_AUTH_PAGES = {
   // below is what keeps that spelling-out honest.
   "/auth/google/callback": "oauth",
   "/auth/github/callback": "oauth",
+  "/auth/oidc/callback": "oauth",
 } as const satisfies Record<string, PublicAuthRequirement> &
   Record<OAuthCallbackPath, "oauth">
 

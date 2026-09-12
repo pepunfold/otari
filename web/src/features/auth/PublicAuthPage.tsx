@@ -69,10 +69,12 @@ export function PublicAuthPage({
       return <ResetPasswordPage hash={hash} />
     case "/auth/google/callback":
     case "/auth/github/callback":
-      // `provider` is non-null on these two arms by construction: it is parsed
-      // from the same path this switch matched. Narrowed with a fallback rather
-      // than an assertion, because a `!` here would be a claim the type system
-      // cannot check and the fallback renders the same panel either way.
+    case "/auth/oidc/callback":
+      // `provider` is non-null on every one of these arms by construction: it
+      // is parsed from the same path this switch matched. Narrowed with a
+      // fallback rather than an assertion, because a `!` here would be a claim
+      // the type system cannot check and the fallback renders the same panel
+      // either way.
       return <OAuthCallbackPage provider={provider ?? ""} hash={hash} />
   }
 }

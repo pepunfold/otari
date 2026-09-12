@@ -69,6 +69,7 @@ export function normalizeBootstrap(wire: WireBootstrap): DeploymentBootstrap {
     // screen already has a sentence for a deployment offering none.
     sign_in_methods: wire.sign_in_methods ?? [],
     oauth_providers: wire.oauth_providers ?? [],
+    oauth_oidc_label: wire.oauth_oidc_label ?? null,
     management_url: wire.management_url ?? null,
     data_plane_url: wire.data_plane_url ?? null,
     docs_url: wire.docs_url ?? null,

@@ -12,6 +12,7 @@ nothing here can stand in for it.
 """
 
 from base64 import urlsafe_b64encode
+from collections.abc import Iterator
 from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any
@@ -19,19 +20,29 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from apron_auth import OAuthClient
+from apron_auth.errors import ConfigurationError, OidcDiscoveryError
+from apron_auth.models import ServerMetadata
+from apron_auth.providers import oidc as apron_oidc
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlmodel import col, select
 
 from gateway.core.config import GatewayConfig
-from gateway.models.tenancy import User
+from gateway.models.tenancy import OAuthPendingState, User
 from gateway.services import oauth_service
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME
 from gateway.services.oauth_service import FLOW_COOKIE_NAME, OAuthIdentity
 
 ORIGIN = "http://testserver"
+# What every refusal on these routes says. They are unauthenticated, so nothing
+# about a provider, its settings or its reachability is answered to whoever
+# asked; the tenancy error handler blanks the body of any status of 500 or
+# above and the status alone carries the refusal. An operator reads the startup
+# warning and the log instead.
+BLANKED_REFUSAL = "Internal server error"
 PASSWORD = "a-real-password"  # pragma: allowlist secret
+OIDC_ISSUER = "https://idp.example.com"
 
 
 @pytest.fixture
@@ -42,6 +53,73 @@ def oauth_configured(test_config: GatewayConfig, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(test_config, "oauth_google_client_secret", "google-secret")
     monkeypatch.setattr(test_config, "oauth_github_client_id", "github-id")
     monkeypatch.setattr(test_config, "oauth_github_client_secret", "github-secret")
+
+
+@pytest.fixture
+def oauth_oidc_configured(test_config: GatewayConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register a generic OIDC connection, discovery stubbed the way the token endpoint already is.
+
+    This file's own docstring is the reason: everything on this side of the
+    exchange stays real, and only the provider's outbound half is replaced.
+    Discovery is now part of that outbound half (a generic connection has no
+    apron-auth preset to fall back on), so it gets the same treatment
+    ``stub_token_endpoint`` gives the token endpoint below.
+    """
+    monkeypatch.setattr(test_config, "public_base_url", ORIGIN)
+    monkeypatch.setattr(test_config, "oauth_oidc_issuer_url", OIDC_ISSUER)
+    monkeypatch.setattr(test_config, "oauth_oidc_client_id", "oidc-id")
+    monkeypatch.setattr(test_config, "oauth_oidc_client_secret", "oidc-secret")
+    monkeypatch.setattr(test_config, "oauth_oidc_display_name", "Acme SSO")
+    stub_oidc_discovery(monkeypatch)
+
+
+def stub_oidc_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    metadata = ServerMetadata(
+        issuer=OIDC_ISSUER,
+        authorize_url=f"{OIDC_ISSUER}/authorize",
+        token_url=f"{OIDC_ISSUER}/token",
+        jwks_url=f"{OIDC_ISSUER}/jwks",
+        userinfo_url=f"{OIDC_ISSUER}/userinfo",
+        code_challenge_methods=["S256"],
+        token_endpoint_auth_methods=["client_secret_post"],
+        iss_parameter_supported=True,
+    )
+
+    async def _discover(*_args: Any, **_kwargs: Any) -> ServerMetadata:
+        return metadata
+
+    monkeypatch.setattr(apron_oidc, "discover", _discover)
+
+
+async def _broken_discover(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for an issuer that cannot be reached at all."""
+    raise OidcDiscoveryError("the issuer did not answer")
+
+
+def _unusable_preset(*_args: Any, **_kwargs: Any) -> Any:
+    """Stand in for a document that was read and names a provider we cannot negotiate with.
+
+    ``ConfigurationError`` is what apron-auth raises for a provider advertising
+    no ``S256``, which is the realistic one: PKCE is the only thing binding a
+    code to the browser that asked for it, so it is refused rather than
+    configured without.
+    """
+    msg = "OpenID provider advertises no S256 code-challenge method; PKCE cannot be negotiated"
+    raise ConfigurationError(msg)
+
+
+@pytest.fixture(autouse=True)
+def _forget_discovered_documents() -> Iterator[None]:
+    """Empty the process-lifetime discovery cache around every test.
+
+    ``oauth_service`` reads an OIDC discovery document once and keeps it, which
+    is right for a running deployment and wrong across tests: a document cached
+    by one would be served to the next, which then never reaches the ``discover``
+    stub it installed.
+    """
+    oauth_service._forget_discovered()
+    yield
+    oauth_service._forget_discovered()
 
 
 def stub_exchange(
@@ -59,7 +137,14 @@ def stub_exchange(
     spent: list[str] = []
 
     async def _exchange(
-        _config: GatewayConfig, provider: str, *, code: str, state: str, flow_secret: str | None, db: Any
+        _config: GatewayConfig,
+        provider: str,
+        *,
+        code: str,
+        state: str,
+        flow_secret: str | None,
+        db: Any,
+        iss: str | None = None,
     ) -> OAuthIdentity:
         spent.append(code)
         return OAuthIdentity(
@@ -116,6 +201,23 @@ def test_a_provider_missing_its_secret_is_not_published(
     assert client.get("/v1/bootstrap").json()["oauth_providers"] == []
 
 
+def test_the_bootstrap_names_oidc_and_its_own_button_text(client: TestClient, oauth_oidc_configured: None) -> None:
+    answered = client.get("/v1/bootstrap").json()
+
+    assert answered["oauth_providers"] == ["oidc"]
+    assert answered["oauth_oidc_label"] == "Acme SSO"
+
+
+def test_an_oidc_connection_missing_its_issuer_is_not_published(
+    client: TestClient, test_config: GatewayConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(test_config, "public_base_url", ORIGIN)
+    monkeypatch.setattr(test_config, "oauth_oidc_client_id", "oidc-id")
+    monkeypatch.setattr(test_config, "oauth_oidc_client_secret", "oidc-secret")
+
+    assert client.get("/v1/bootstrap").json()["oauth_providers"] == []
+
+
 # ---------- starting the flow ----------
 
 
@@ -141,13 +243,15 @@ def test_authorize_needs_no_credential(client: TestClient, oauth_configured: Non
     assert client.get("/v1/auth/oauth/google/authorize").status_code == 200
 
 
-def test_authorize_refuses_an_unconfigured_provider_and_names_the_settings(
+def test_authorize_refuses_an_unconfigured_provider_without_saying_why(
     client: TestClient,
 ) -> None:
     response = client.get("/v1/auth/oauth/google/authorize")
 
     assert response.status_code == 503
-    assert "oauth_google_client_id" in response.json()["detail"]
+    # Not "Set oauth_google_client_id ...": that names settings to an
+    # unauthenticated caller. The error still carries them, for the log.
+    assert response.json()["detail"] == BLANKED_REFUSAL
 
 
 def test_a_provider_this_deployment_could_never_configure_is_not_a_route(
@@ -156,6 +260,97 @@ def test_a_provider_this_deployment_could_never_configure_is_not_a_route(
     # The path parameter is bounded by the config vocabulary, so an unknown
     # segment is refused by the framework rather than by a handler.
     assert client.get("/v1/auth/oauth/not-a-provider/authorize").status_code == 422
+
+
+def test_oidc_authorize_refuses_an_unconfigured_connection_without_saying_why(client: TestClient) -> None:
+    response = client.get("/v1/auth/oauth/oidc/authorize")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == BLANKED_REFUSAL
+
+
+def test_oidc_authorize_is_built_from_discovery_and_binds_the_code_with_pkce(
+    client: TestClient, oauth_oidc_configured: None, db_session: Session
+) -> None:
+    """The discovered endpoint, and the verifier whose challenge was just sent.
+
+    PKCE carries the whole binding of an authorization code to the browser that
+    asked for it here: apron-auth's generic connection sends no ``nonce``, so
+    there is no second mechanism to fall back on and the challenge being
+    present is the property worth asserting.
+    """
+    started = client.get("/v1/auth/oauth/oidc/authorize")
+
+    assert started.status_code == 200, started.text
+    authorization_url = started.json()["authorization_url"]
+    assert authorization_url.startswith(f"{OIDC_ISSUER}/authorize?")
+    query = parse_qs(urlsplit(authorization_url).query)
+    assert query["code_challenge_method"] == ["S256"]
+
+    row = db_session.execute(select(OAuthPendingState).where(col(OAuthPendingState.provider) == "oidc")).scalar_one()
+    assert row.code_verifier
+    assert query["code_challenge"] == [
+        urlsafe_b64encode(sha256(row.code_verifier.encode()).digest()).rstrip(b"=").decode()
+    ]
+
+
+def test_a_discovery_outage_is_a_distinct_refusal_from_not_configured(
+    client: TestClient, oauth_oidc_configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The status and nothing else: an unreachable issuer is not a fact this route hands out."""
+    monkeypatch.setattr(apron_oidc, "discover", _broken_discover)
+
+    response = client.get("/v1/auth/oauth/oidc/authorize")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == BLANKED_REFUSAL
+
+
+def test_a_provider_this_deployment_cannot_negotiate_with_does_not_invite_a_retry(
+    client: TestClient, oauth_oidc_configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other refusal, whose whole point is that it is not the retryable one.
+
+    Discovery succeeded here: what failed is the negotiation over what it
+    named, and nothing about that changes on a second attempt, so the message
+    has to send the person to an operator rather than back to the button.
+    """
+    monkeypatch.setattr(apron_oidc, "preset", _unusable_preset)
+
+    response = client.get("/v1/auth/oauth/oidc/authorize")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == BLANKED_REFUSAL
+
+
+def test_a_discovery_outage_on_the_callback_says_the_same_thing(
+    client: TestClient, oauth_oidc_configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the flow, where the same outage would read as a refused credential.
+
+    Started for real first: the flow cookie ``/authorize`` sets is what the
+    callback checks before anything else, so breaking discovery ahead of it
+    would refuse this for the wrong reason.
+
+    That start also caches the document, which is the point of the cache and
+    would carry this callback straight past discovery to the exchange. Dropped
+    here so the callback reads discovery for itself, the way it does in a
+    process that has not served an authorization yet: a browser can arrive at
+    the callback of a gateway that has since restarted, or at a different one
+    behind the same address.
+    """
+    started = client.get("/v1/auth/oauth/oidc/authorize")
+    assert started.status_code == 200, started.text
+
+    oauth_service._forget_discovered()
+    monkeypatch.setattr(apron_oidc, "discover", _broken_discover)
+    response = client.post(
+        "/v1/auth/oauth/oidc/callback",
+        json={"code": "a-code", "state": started.json()["state"]},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == BLANKED_REFUSAL
 
 
 # ---------- finishing the flow ----------
@@ -188,6 +383,23 @@ def test_a_rostered_member_signs_in_and_gets_the_same_session_a_password_would(
     membership = client.get("/v1/organizations/me")
     assert membership.status_code == 200, membership.text
     assert membership.json()["organization"]["id"] == body["active_organization_id"]
+
+
+def test_a_rostered_member_signs_in_via_oidc_and_gets_the_same_session_a_password_would(
+    client: TestClient,
+    master_key_header: dict[str, str],
+    oauth_oidc_configured: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id = add_member(client, master_key_header, email="ada@example.com")
+    spent = stub_exchange(monkeypatch)
+
+    response = client.post("/v1/auth/oauth/oidc/callback", json={"code": "the-code", "state": "s"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["user_id"] == user_id
+    assert SESSION_COOKIE_NAME in response.cookies
+    assert spent == ["the-code"]
 
 
 def test_the_provider_is_recorded_on_the_identity_it_signed_in(
@@ -319,7 +531,7 @@ def test_the_callback_refuses_an_unconfigured_provider_before_spending_anything(
     response = client.post("/v1/auth/oauth/google/callback", json={"code": "c", "state": "s"})
 
     assert response.status_code == 503
-    assert "oauth_google_client_id" in response.json()["detail"]
+    assert response.json()["detail"] == BLANKED_REFUSAL
     assert spent == []
 
 

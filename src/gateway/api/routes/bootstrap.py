@@ -251,6 +251,16 @@ class DeploymentBootstrap(BaseModel):
             "gateway, which issues no session."
         )
     )
+    oauth_oidc_label: str | None = Field(
+        default=None,
+        description=(
+            "The sign-in button text for the 'oidc' entry in oauth_providers, when that provider is "
+            "configured with one (oauth_oidc_display_name). Unlike 'Google' or 'GitHub', a generic "
+            "connection has no brand name this dashboard can hardcode, so an operator supplies one and "
+            "the dashboard falls back to a generic label when this is null, including when oauth_providers "
+            "does not carry 'oidc' at all, in which case this is always null and unread."
+        )
+    )
     mail_ready: bool = Field(
         description=(
             "Whether this deployment can deliver a message carrying a link back to itself "
@@ -298,6 +308,7 @@ async def get_bootstrap(
             maintenance_mode=False,
             passkeys_ready=False,
             oauth_providers=[],
+            oauth_oidc_label=None,
             mail_ready=False,
         )
     assert db is not None  # get_db_if_needed yields a session outside hybrid mode
@@ -323,6 +334,7 @@ async def get_bootstrap(
         maintenance_mode=await _maintenance_mode(db),
         passkeys_ready=config.webauthn_enabled,
         oauth_providers=list(config.oauth_providers),
+        oauth_oidc_label=config.oauth_oidc_display_name if "oidc" in config.oauth_providers else None,
         mail_ready=config.mail_ready,
     )
 

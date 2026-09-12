@@ -234,8 +234,9 @@ export async function completeOAuthSignIn(
   provider: string,
   code: string,
   state: string,
+  iss?: string,
 ): Promise<SignInResult> {
-  const payload: OAuthCallbackRequest = { code, state }
+  const payload: OAuthCallbackRequest = { code, state, iss: iss ?? null }
   const finished = await publicPost(
     `/v1/auth/oauth/${encodeURIComponent(provider)}/callback`,
     payload,
